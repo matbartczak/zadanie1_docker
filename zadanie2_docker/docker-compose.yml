@@ -1,0 +1,31 @@
+services:
+  php-app:
+    build: .
+    container_name: zad2-php
+    ports:
+      - "8080:80"
+    volumes:
+      - ./src:/var/www/html
+    networks:
+      - backend
+    depends_on:
+      - db
+    env_file: "users.env"
+
+  db:
+    image: postgres:16
+    container_name: postgres-db
+    restart: always
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - backend
+networks:
+  backend: {}
+
+volumes:
+  db_data: {}
