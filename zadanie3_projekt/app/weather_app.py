@@ -6,14 +6,76 @@ from datetime import datetime
 from opensearchpy import OpenSearch, helpers
 import time
 
-df = pd.read_csv("europe_cities.csv")
+def detect_weather_anomaly(record: dict) -> dict:
+    anomalies = []
 
-lats = df["lat"].to_list()
-lngs = df['lng'].to_list()
-ids = df.loc[:, ['id','city','country']].values.tolist()
+    temp = record["temperature"]
+    wind = record["wind_speed"]
+    gusts = record["wind_gusts"]
+    pressure = record["surface_pressure"]
+    humidity = record["humidity"]
+    clouds = record["cloud_cover"]
+
+    # Temperatura
+    if temp > 35:
+        anomalies.append("HIGH_TEMPERATURE")
+    elif temp < -25:
+        anomalies.append("LOW_TEMPERATURE")
+
+    # Wiatr
+    if wind > 20:
+        anomalies.append("STRONG_WIND")
+    if gusts > 30:
+        anomalies.append("STRONG_WIND_GUSTS")
+
+    # Ciśnienie
+    if pressure < 980:
+        anomalies.append("LOW_PRESSURE")
+    elif pressure > 1040:
+        anomalies.append("HIGH_PRESSURE")
+
+    # Spójność danych
+    if clouds == 0 and humidity > 90:
+        anomalies.append("INCONSISTENT_CLOUD_HUMIDITY")
+
+    # Status końcowy
+    record["anomaly"] = len(anomalies) > 0
+    record["anomaly_types"] = anomalies
+
+    return record
+
 print("APP STARTING...")
 time.sleep(60)
 while True:
+
+    
+    host = 'opensearch'
+    port = 9200
+
+    # Create the client with SSL/TLS and hostname verification disabled.
+    client = OpenSearch(
+        hosts = [{'host': host, 'port': port, 'scheme': 'https'}],
+        http_compress = True, # enables gzip compression for request bodies
+        use_ssl = True,
+        verify_certs = False,
+        ssl_assert_hostname = False,
+        ssl_show_warn = False,
+        http_auth=('admin', 'QWERTYadmin123!@#'),  # login/admin password
+    )
+
+    query = {
+        "size": 500,
+        "query": {
+            "match_all": {}
+        }
+    }
+    ids = [ {"id":city['_source']['id'] ,"city":city['_source']['city'] ,"country":city['_source']['country'] , "location": city['_source']['location'] } for city in city_doc]
+    lats = [lat['location'][1] for lat in ids]
+    lngs = [lng['location'][0] for lng in ids]
+
+    resp = client.search(index="python-cities-index", body=query)
+    city_doc = resp["hits"]["hits"]
+
    
     # Setup the Open-Meteo API client with cache and retry on error
     cache_session = requests_cache.CachedSession('.cache', expire_after = 3600)
@@ -54,20 +116,7 @@ while True:
         temp["surface_pressure"] = round(current.Variables(6).Value(), 2) 
         result.append( (f"{str(id[0])}_{str(temp_datetime_id)}", temp) ) #tuple(id, dict)
 
-
-    host = 'opensearch'
-    port = 9200
-
-    # Create the client with SSL/TLS and hostname verification disabled.
-    client = OpenSearch(
-        hosts = [{'host': host, 'port': port, 'scheme': 'https'}],
-        http_compress = True, # enables gzip compression for request bodies
-        use_ssl = True,
-        verify_certs = False,
-        ssl_assert_hostname = False,
-        ssl_show_warn = False,
-        http_auth=('admin', 'QWERTYadmin123!@#'),  # login/admin password
-    )
+    result = [ (res[0],detect_weather_anomaly(res[1])) for res in result]
 
     actions = [
         {
