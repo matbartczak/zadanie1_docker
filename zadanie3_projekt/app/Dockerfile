@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY . .
 
 # Run the app
-CMD ["python", "weather_app.py"]
+CMD ["python","-u", "weather_app.py"]
