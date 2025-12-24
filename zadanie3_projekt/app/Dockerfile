@@ -19,5 +19,9 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy application code
 COPY . .
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["python", "/app/healthcheck.py"]
+
+
 # Run the app
 CMD ["python","-u", "weather_app.py"]

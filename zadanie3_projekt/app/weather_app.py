@@ -4,6 +4,43 @@ from retry_requests import retry
 from datetime import datetime
 from opensearchpy import OpenSearch, helpers
 import time
+import os
+import sys
+import threading
+import socket
+
+# ---------------- CONFIG ----------------
+
+HEARTBEAT = "/tmp/heartbeat"
+WATCHDOG_TIMEOUT = 1800      # 30 minutes
+SLEEP_INTERVAL = 900         # 15 minutes
+SOCKET_TIMEOUT = 20          # seconds
+
+# ----------------------------------------
+
+socket.setdefaulttimeout(SOCKET_TIMEOUT)
+
+
+def touch_heartbeat():
+    with open(HEARTBEAT, "w") as f:
+        f.write(str(time.time()))
+
+
+def watchdog():
+    """Kills the process if heartbeat is stale"""
+    while True:
+        time.sleep(30)
+        if not os.path.exists(HEARTBEAT):
+            continue
+
+        age = time.time() - os.path.getmtime(HEARTBEAT)
+        if age > WATCHDOG_TIMEOUT:
+            print(f"WATCHDOG: heartbeat stale ({age:.0f}s). Exiting.")
+            sys.exit(1)   # <-- Docker restart trigger
+
+
+threading.Thread(target=watchdog, daemon=True).start()
+
 
 def detect_weather_anomaly(record: dict) -> dict:
     anomalies = []
@@ -15,139 +52,133 @@ def detect_weather_anomaly(record: dict) -> dict:
     humidity = record["humidity"]
     clouds = record["cloud_cover"]
 
-    # Temperatura
     if temp > 35:
         anomalies.append("HIGH_TEMPERATURE")
     elif temp < -25:
         anomalies.append("LOW_TEMPERATURE")
 
-    # Wiatr
     if wind > 20:
         anomalies.append("STRONG_WIND")
     if gusts > 30:
         anomalies.append("STRONG_WIND_GUSTS")
 
-    # Ciśnienie
     if pressure < 980:
         anomalies.append("LOW_PRESSURE")
     elif pressure > 1040:
         anomalies.append("HIGH_PRESSURE")
 
-    # Spójność danych
     if clouds == 0 and humidity > 90:
         anomalies.append("INCONSISTENT_CLOUD_HUMIDITY")
 
-    # Status końcowy
-    record["anomaly"] = len(anomalies) > 0
+    record["anomaly"] = bool(anomalies)
     record["anomaly_types"] = anomalies
-
     return record
 
+
 print("APP STARTING...")
+touch_heartbeat()
 time.sleep(60)
+
 while True:
 
-    try:
-        host = 'opensearch'
-        port = 9200
+    touch_heartbeat()
 
-        # Create the client with SSL/TLS and hostname verification disabled.
-        client = OpenSearch(
-            hosts = [{'host': host, 'port': port, 'scheme': 'https'}],
-            http_compress = True, # enables gzip compression for request bodies
-            use_ssl = True,
-            verify_certs = False,
-            ssl_assert_hostname = False,
-            ssl_show_warn = False,
-            http_auth=('admin', 'QWERTYadmin123!@#'),  # login/admin password
-            timeout=10,
-            max_retries=3,
-            retry_on_timeout=True,
-        )
+    client = OpenSearch(
+        hosts=[{"host": "opensearch", "port": 9200, "scheme": "https"}],
+        http_compress=True,
+        use_ssl=True,
+        verify_certs=False,
+        ssl_assert_hostname=False,
+        ssl_show_warn=False,
+        http_auth=("admin", "QWERTYadmin123!@#"),
+        timeout=10,
+        max_retries=3,
+        retry_on_timeout=True,
+    )
 
-        query = {
-            "size": 500,
-            "query": {
-                "match_all": {}
-            }
+    query = {"size": 500, "query": {"match_all": {}}}
+    resp = client.search(index="python-cities-index", body=query)
+    city_doc = resp["hits"]["hits"]
+
+    ids = [
+        {
+            "id": c["_source"]["id"],
+            "city": c["_source"]["city"],
+            "country": c["_source"]["country"],
+            "location": c["_source"]["location"],
         }
-        
-        resp = client.search(index="python-cities-index", body=query)
-        city_doc = resp["hits"]["hits"]
+        for c in city_doc
+    ]
 
-        ids = [
-            {
-                "id": city['_source']['id'],
-                "city": city['_source']['city'],
-                "country": city['_source']['country'],
-                "location": city['_source']['location']
-            }
-            for city in city_doc
-        ]
-        lats = [lat['location'][1] for lat in ids]
-        lngs = [lng['location'][0] for lng in ids]
-    
-        # Setup the Open-Meteo API client with cache and retry on error
-        cache_session = requests_cache.CachedSession('.cache', expire_after = 3600)
-        retry_session = retry(cache_session, retries = 5, backoff_factor = 0.2)
-        openmeteo = openmeteo_requests.Client(session = retry_session)
+    lats = [c["location"][1] for c in ids]
+    lngs = [c["location"][0] for c in ids]
 
+    touch_heartbeat()
 
-        # Make sure all required weather variables are listed here
-        # The order of variables in hourly or daily is important to assign them correctly below
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
+    cache_session = requests_cache.CachedSession(".cache", expire_after=3600)
+    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    openmeteo = openmeteo_requests.Client(session=retry_session)
+
+    responses = openmeteo.weather_api(
+        "https://api.open-meteo.com/v1/forecast",
+        {
             "latitude": lats,
             "longitude": lngs,
-            "current": ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m", "cloud_cover", "surface_pressure"],
+            "current": [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "wind_gusts_10m",
+                "cloud_cover",
+                "surface_pressure",
+            ],
             "timezone": "Europe/Berlin",
-            
+        },
+    )
+
+    touch_heartbeat()
+
+    result = []
+    for meta, response in zip(ids, responses):
+        current = response.Current()
+        ts = int(datetime.fromtimestamp(current.Time()).strftime("%Y%m%d%H%M%S"))
+
+        data = {
+            "city": meta["city"],
+            "country": meta["country"],
+            "location": meta["location"],
+            "datetime_id": ts,
+            "temperature": current.Variables(0).Value(),
+            "humidity": current.Variables(1).Value(),
+            "wind_speed": current.Variables(2).Value(),
+            "wind_direction": current.Variables(3).Value(),
+            "wind_gusts": current.Variables(4).Value(),
+            "cloud_cover": current.Variables(5).Value(),
+            "surface_pressure": current.Variables(6).Value(),
         }
-        try:
-            responses = openmeteo.weather_api(url, params=params)
-        except Exception as e:
-            print("OpenMeteo failed:", e)
-            time.sleep(60)
-            continue
 
+        result.append(
+            (f"{meta['id']}_{ts}", detect_weather_anomaly(data))
+        )
 
-        temp = dict()
-        result = list()
+    actions = [
+        {
+            "_op_type": "update",
+            "_index": "python-weather5-index",
+            "_id": doc_id,
+            "doc": doc,
+            "doc_as_upsert": True,
+        }
+        for doc_id, doc in result
+    ]
 
-        for id,response,lat,lng in zip(ids,responses,lats, lngs):
+    helpers.bulk(client, actions, refresh=False, request_timeout=30)
 
-            current = response.Current()
-            temp = dict()
-            temp_datetime_id = int(datetime.fromtimestamp(current.Time()).strftime('%Y%m%d%H%M%S'))
-            temp["city"] = id[1]
-            temp["country"] = id[2]
-            temp['location'] = [lng, lat]
-            temp["datetime_id"] = temp_datetime_id
-            temp["temperature"] = round(current.Variables(0).Value(), 2) 
-            temp["humidity"] = current.Variables(1).Value()
-            temp["wind_speed"] =  current.Variables(2).Value()
-            temp["wind_direction"] = current.Variables(3).Value()
-            temp["wind_gusts"] = current.Variables(4).Value()
-            temp["cloud_cover"] = current.Variables(5).Value()
-            temp["surface_pressure"] = round(current.Variables(6).Value(), 2) 
-            result.append( (f"{str(id[0])}_{str(temp_datetime_id)}", temp) ) #tuple(id, dict)
+    print(f"[INFO] Executed at {datetime.now()} | docs: {len(actions)}")
 
-        result = [ (res[0],detect_weather_anomaly(res[1])) for res in result]
-
-        actions = [
-            {
-                '_op_type': 'update',
-                '_index': 'python-weather5-index',
-                '_id': res[0],                    # document id
-                'doc': res[1],
-                'doc_as_upsert': True          # if doc doesn't exist -> create
-            } for res in result
-        ]
-
-        success, failed = helpers.bulk(client, actions, refresh=False, request_timeout=30)
-        print(f"Success: {success}, Failed: {failed}")
-        print(f"[INFO] Script executed at {datetime.now()}")
-        time.sleep(900)
-    except Exception as e:
-        print("FATAL LOOP ERROR:", e)
-        time.sleep(60)
+    # ---- SAFE SLEEP ----
+    end = time.time() + SLEEP_INTERVAL
+    while time.time() < end:
+        touch_heartbeat()
+        time.sleep(5)
